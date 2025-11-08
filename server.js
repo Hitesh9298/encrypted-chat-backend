@@ -56,7 +56,6 @@ app.post("/api/register", async (req, res) => {
 
     const token = jwt.sign({ id: user._id, username }, JWT_SECRET, { expiresIn: "7d" });
 
-    // Return user data and token - publicKey is already saved in DB
     res.json({ 
       user: { username: user.username, email: user.email }, 
       token 
@@ -78,7 +77,6 @@ app.post("/api/login", async (req, res) => {
       return res.status(400).json({ error: "Missing credentials" });
     }
 
-    // Find user by username OR email
     const user = username 
       ? await User.findOne({ username }) 
       : await User.findOne({ email });
@@ -104,7 +102,7 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
-// Get public key for a username
+// Get public key for a username - NEW ROUTE FOR DM
 app.get("/api/public-key/:username", async (req, res) => {
   try {
     console.log("🔑 Fetching public key for:", req.params.username);
@@ -125,7 +123,7 @@ app.get("/api/public-key/:username", async (req, res) => {
   }
 });
 
-// Upload public key to server (used if user logs in without keys)
+// Upload public key to server
 app.post("/api/uploadPublicKey", async (req, res) => {
   try {
     const token = req.headers.authorization?.split(" ")[1];
@@ -162,7 +160,7 @@ app.post("/api/uploadPublicKey", async (req, res) => {
   }
 });
 
-// Get user list (for demo)
+// Get user list
 app.get("/api/users", async (req, res) => {
   try {
     console.log("📋 Fetching user list...");
@@ -175,8 +173,9 @@ app.get("/api/users", async (req, res) => {
   }
 });
 
-// --- Socket.IO Chat ---
-const connectedUsers = new Map();
+// --- Socket.IO Chat with DM Support ---
+const connectedUsers = new Map(); // Map<socketId, username>
+const userSockets = new Map();    // Map<username, socketId> for DM routing
 
 io.on("connection", (socket) => {
   console.log("🔌 New client connected:", socket.id);
@@ -185,24 +184,68 @@ io.on("connection", (socket) => {
     console.log("👤 User joining:", username);
     socket.username = username;
     connectedUsers.set(socket.id, username);
+    userSockets.set(username, socket.id);
     socket.join("general");
     io.emit("userList", Array.from(connectedUsers.values()));
     console.log("✅ User joined:", username, "| Total users:", connectedUsers.size);
   });
 
+  // Room message (existing - unchanged)
   socket.on("message", async (data) => {
-    console.log("💬 Message from", data.sender, "->", data.recipient || "all");
+    console.log("💬 Room message from", data.sender);
     try {
-      const msg = await Message.create(data);
-      if (data.recipient) {
-        io.emit("message", data);
-      } else {
-        io.to(data.room || "general").emit("message", data);
-      }
+      await Message.create(data);
+      io.to(data.room || "general").emit("message", data);
     } catch (err) {
       console.error("❌ Error saving message:", err);
     }
   });
+
+  // NEW: Direct message handler
+ // Replace your entire "directMessage" socket handler with this:
+
+socket.on("directMessage", async (data) => {
+  const { recipient, sender, encryptedAESKey, encryptedMessage } = data;
+  console.log(`📧 DM from ${sender} to ${recipient}`);
+  console.log(`📧 Encrypted data:`, { 
+    hasAESKey: !!encryptedAESKey, 
+    hasMessage: !!encryptedMessage,
+    messageKeys: encryptedMessage ? Object.keys(encryptedMessage) : []
+  });
+  
+  try {
+    // Save to database
+    await Message.create({
+      sender,
+      recipient,
+      ciphertext: encryptedMessage.ciphertext,
+      iv: encryptedMessage.iv,
+      encryptedAESKey,
+      timestamp: new Date(),
+    });
+
+    // Get recipient's socket ID
+    const recipientSocketId = userSockets.get(recipient);
+    
+    console.log(`🔍 Looking for recipient ${recipient}, found socket:`, recipientSocketId);
+    console.log(`🔍 Current userSockets map:`, Array.from(userSockets.entries()));
+    
+    if (recipientSocketId) {
+      // Send to recipient - they need to decrypt it
+      io.to(recipientSocketId).emit("directMessage", {
+        sender,
+        encryptedAESKey,
+        encryptedMessage,
+      });
+      console.log(`✅ DM delivered to ${recipient} on socket ${recipientSocketId}`);
+    } else {
+      console.log(`⚠️ ${recipient} is offline - message saved to DB only`);
+    }
+  } catch (err) {
+    console.error("❌ Error handling DM:", err);
+    console.error("❌ Error stack:", err.stack);
+  }
+});
 
   socket.on("typing", (room) => {
     socket.to(room).emit("typing", socket.username);
@@ -214,9 +257,14 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     const username = connectedUsers.get(socket.id);
-    connectedUsers.delete(socket.id);
-    io.emit("userList", Array.from(connectedUsers.values()));
-    console.log("❌ Client disconnected:", username || socket.id, "| Remaining:", connectedUsers.size);
+    console.log(`❌ Client disconnected: ${username || socket.id}`);
+    
+    if (username) {
+      connectedUsers.delete(socket.id);
+      userSockets.delete(username);
+      io.emit("userList", Array.from(connectedUsers.values()));
+      console.log("Remaining users:", connectedUsers.size);
+    }
   });
 });
 
