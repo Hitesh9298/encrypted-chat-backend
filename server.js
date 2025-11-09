@@ -17,7 +17,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// DB connect
 mongoose
   .connect(process.env.MONGO_URI || "mongodb://127.0.0.1:27017/e2e-chat")
   .then(() => console.log("✅ MongoDB Connected"))
@@ -30,13 +29,25 @@ const io = new Server(server, {
 
 const JWT_SECRET = process.env.JWT_SECRET || "change_me_secret";
 
-// --- AUTH & USER ROUTES ---
+const verifyToken = (req, res, next) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+};
 
-// Register: expects { username, email, password, publicKey }
+// AUTH ROUTES
 app.post("/api/register", async (req, res) => {
   try {
     const { username, email, password, publicKey } = req.body;
-    console.log("📝 Register request:", { username, email, hasPublicKey: !!publicKey });
+    console.log("🔐 Register request:", { username, email, hasPublicKey: !!publicKey });
     
     if (!username || !email || !password || !publicKey) {
       console.log("❌ Missing fields");
@@ -66,7 +77,6 @@ app.post("/api/register", async (req, res) => {
   }
 });
 
-// Login: accepts username OR email
 app.post("/api/login", async (req, res) => {
   try {
     const { username, email, password } = req.body;
@@ -102,7 +112,6 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
-// Get public key for a username - NEW ROUTE FOR DM
 app.get("/api/public-key/:username", async (req, res) => {
   try {
     console.log("🔑 Fetching public key for:", req.params.username);
@@ -123,17 +132,9 @@ app.get("/api/public-key/:username", async (req, res) => {
   }
 });
 
-// Upload public key to server
-app.post("/api/uploadPublicKey", async (req, res) => {
+app.post("/api/uploadPublicKey", verifyToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split(" ")[1];
-    if (!token) {
-      console.log("❌ Missing authorization token");
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-    console.log("🔐 Upload public key for user:", decoded.username);
+    console.log("🔐 Upload public key for user:", req.user.username);
 
     const { publicKey } = req.body;
     if (!publicKey) {
@@ -142,13 +143,13 @@ app.post("/api/uploadPublicKey", async (req, res) => {
     }
 
     const user = await User.findByIdAndUpdate(
-      decoded.id, 
+      req.user.id, 
       { publicKey },
       { new: true }
     );
     
     if (!user) {
-      console.log("❌ User not found:", decoded.id);
+      console.log("❌ User not found:", req.user.id);
       return res.status(404).json({ error: "User not found" });
     }
 
@@ -160,7 +161,6 @@ app.post("/api/uploadPublicKey", async (req, res) => {
   }
 });
 
-// Get user list
 app.get("/api/users", async (req, res) => {
   try {
     console.log("📋 Fetching user list...");
@@ -173,86 +173,308 @@ app.get("/api/users", async (req, res) => {
   }
 });
 
-// --- Socket.IO Chat with DM Support ---
-const connectedUsers = new Map(); // Map<socketId, username>
-const userSockets = new Map();    // Map<username, socketId> for DM routing
+// ROOM ROUTES
+app.post("/api/rooms", verifyToken, async (req, res) => {
+  try {
+    const { name, description, members } = req.body;
+    const creator = req.user.username;
+
+    console.log("🏗️ Creating room:", { name, creator, members });
+
+    if (!name || name.trim().length === 0) {
+      return res.status(400).json({ error: "Room name is required" });
+    }
+
+    const existing = await Room.findOne({ name: name.toLowerCase() });
+    if (existing) {
+      return res.status(400).json({ error: "Room already exists" });
+    }
+
+    const memberList = members && Array.isArray(members) 
+      ? [...new Set([creator, ...members])]
+      : [creator];
+
+    const room = await Room.create({
+      name: name.toLowerCase(),
+      description: description || "",
+      members: memberList,
+      createdBy: creator,
+    });
+
+    console.log("✅ Room created:", room.name, "with members:", memberList);
+    
+    io.emit("roomCreated", {
+      name: room.name,
+      description: room.description,
+      members: room.members,
+      createdBy: room.createdBy,
+      memberCount: room.members.length,
+    });
+
+    memberList.forEach((member) => {
+      if (member !== creator) {
+        const memberSocketId = userSockets.get(member);
+        if (memberSocketId) {
+          io.to(memberSocketId).emit("addedToRoom", {
+            roomName: room.name,
+            addedBy: creator,
+            description: room.description,
+          });
+          console.log(`✅ Notified ${member} about being added to ${room.name}`);
+        }
+      }
+    });
+
+    res.json({ 
+      room: {
+        name: room.name,
+        description: room.description,
+        members: room.members,
+        createdBy: room.createdBy,
+        memberCount: room.members.length,
+      }
+    });
+  } catch (err) {
+    console.error("❌ Error creating room:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/api/rooms", verifyToken, async (req, res) => {
+  try {
+    console.log("📋 Fetching rooms for user:", req.user.username);
+    
+    const rooms = await Room.find({});
+    
+    console.log("✅ Found rooms:", rooms.length);
+    res.json({ 
+      rooms: rooms.map(r => ({
+        name: r.name,
+        description: r.description,
+        members: r.members,
+        createdBy: r.createdBy,
+        memberCount: r.members.length,
+      }))
+    });
+  } catch (err) {
+    console.error("❌ Error fetching rooms:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/api/rooms/:roomName/join", verifyToken, async (req, res) => {
+  try {
+    const { roomName } = req.params;
+    const username = req.user.username;
+
+    console.log("👤 User joining room:", { username, roomName });
+
+    const room = await Room.findOne({ name: roomName.toLowerCase() });
+    if (!room) {
+      return res.status(404).json({ error: "Room not found" });
+    }
+
+    if (room.members.includes(username)) {
+      return res.status(400).json({ error: "Already a member" });
+    }
+
+    room.members.push(username);
+    await room.save();
+
+    console.log("✅ User joined room:", { username, roomName });
+
+    io.emit("userJoinedRoom", {
+      room: roomName,
+      username,
+      members: room.members,
+    });
+
+    res.json({ 
+      message: "Joined room successfully",
+      room: {
+        name: room.name,
+        members: room.members,
+        memberCount: room.members.length,
+      }
+    });
+  } catch (err) {
+    console.error("❌ Error joining room:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/api/rooms/:roomName/leave", verifyToken, async (req, res) => {
+  try {
+    const { roomName } = req.params;
+    const username = req.user.username;
+
+    console.log("🚪 User leaving room:", { username, roomName });
+
+    if (roomName.toLowerCase() === "general") {
+      return res.status(400).json({ error: "Cannot leave general room" });
+    }
+
+    const room = await Room.findOne({ name: roomName.toLowerCase() });
+    if (!room) {
+      return res.status(404).json({ error: "Room not found" });
+    }
+
+    room.members = room.members.filter(m => m !== username);
+    await room.save();
+
+    console.log("✅ User left room:", { username, roomName });
+
+    io.emit("userLeftRoom", {
+      room: roomName,
+      username,
+      members: room.members,
+    });
+
+    res.json({ 
+      message: "Left room successfully",
+    });
+  } catch (err) {
+    console.error("❌ Error leaving room:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.delete("/api/rooms/:roomName", verifyToken, async (req, res) => {
+  try {
+    const { roomName } = req.params;
+    const username = req.user.username;
+
+    console.log("🗑️ Deleting room:", { username, roomName });
+
+    if (roomName.toLowerCase() === "general") {
+      return res.status(400).json({ error: "Cannot delete general room" });
+    }
+
+    const room = await Room.findOne({ name: roomName.toLowerCase() });
+    if (!room) {
+      return res.status(404).json({ error: "Room not found" });
+    }
+
+    if (room.createdBy !== username) {
+      return res.status(403).json({ error: "Only room creator can delete" });
+    }
+
+    await Room.deleteOne({ name: roomName.toLowerCase() });
+
+    console.log("✅ Room deleted:", roomName);
+
+    io.emit("roomDeleted", { room: roomName });
+
+    res.json({ message: "Room deleted successfully" });
+  } catch (err) {
+    console.error("❌ Error deleting room:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// SOCKET.IO
+const connectedUsers = new Map();
+const userSockets = new Map();
 
 io.on("connection", (socket) => {
   console.log("🔌 New client connected:", socket.id);
 
-  socket.on("join", (username) => {
+  socket.on("join", async (username) => {
     console.log("👤 User joining:", username);
     socket.username = username;
     connectedUsers.set(socket.id, username);
     userSockets.set(username, socket.id);
+    
     socket.join("general");
+    
+    try {
+      const userRooms = await Room.find({ members: username });
+      userRooms.forEach(room => {
+        socket.join(room.name);
+        console.log(`✅ ${username} auto-joined room: ${room.name}`);
+      });
+    } catch (err) {
+      console.error("Error loading user rooms:", err);
+    }
+    
     io.emit("userList", Array.from(connectedUsers.values()));
     console.log("✅ User joined:", username, "| Total users:", connectedUsers.size);
   });
 
-  // Room message (existing - unchanged)
+  socket.on("joinRoom", async (roomName) => {
+    console.log(`👤 ${socket.username} joining room:`, roomName);
+    socket.join(roomName.toLowerCase());
+  });
+
+  socket.on("leaveRoom", (roomName) => {
+    console.log(`🚪 ${socket.username} leaving room:`, roomName);
+    socket.leave(roomName.toLowerCase());
+  });
+
   socket.on("message", async (data) => {
-    console.log("💬 Room message from", data.sender);
+    console.log("💬 Room message from", data.sender, "to room:", data.room);
     try {
       await Message.create(data);
+      // Emit to everyone in the room INCLUDING the sender
       io.to(data.room || "general").emit("message", data);
     } catch (err) {
       console.error("❌ Error saving message:", err);
     }
   });
 
-  // NEW: Direct message handler
- // Replace your entire "directMessage" socket handler with this:
-
-socket.on("directMessage", async (data) => {
-  const { recipient, sender, encryptedAESKey, encryptedMessage } = data;
-  console.log(`📧 DM from ${sender} to ${recipient}`);
-  console.log(`📧 Encrypted data:`, { 
-    hasAESKey: !!encryptedAESKey, 
-    hasMessage: !!encryptedMessage,
-    messageKeys: encryptedMessage ? Object.keys(encryptedMessage) : []
-  });
-  
-  try {
-    // Save to database
-    await Message.create({
-      sender,
-      recipient,
-      ciphertext: encryptedMessage.ciphertext,
-      iv: encryptedMessage.iv,
-      encryptedAESKey,
-      timestamp: new Date(),
-    });
-
-    // Get recipient's socket ID
-    const recipientSocketId = userSockets.get(recipient);
+  socket.on("directMessage", async (data) => {
+    const { recipient, sender, encryptedAESKey, encryptedMessage } = data;
+    console.log(`📧 DM from ${sender} to ${recipient}`);
     
-    console.log(`🔍 Looking for recipient ${recipient}, found socket:`, recipientSocketId);
-    console.log(`🔍 Current userSockets map:`, Array.from(userSockets.entries()));
-    
-    if (recipientSocketId) {
-      // Send to recipient - they need to decrypt it
-      io.to(recipientSocketId).emit("directMessage", {
+    try {
+      await Message.create({
         sender,
+        recipient,
+        ciphertext: encryptedMessage.ciphertext,
+        iv: encryptedMessage.iv,
         encryptedAESKey,
-        encryptedMessage,
+        timestamp: new Date(),
       });
-      console.log(`✅ DM delivered to ${recipient} on socket ${recipientSocketId}`);
-    } else {
-      console.log(`⚠️ ${recipient} is offline - message saved to DB only`);
-    }
-  } catch (err) {
-    console.error("❌ Error handling DM:", err);
-    console.error("❌ Error stack:", err.stack);
-  }
-});
 
+      const recipientSocketId = userSockets.get(recipient);
+      
+      if (recipientSocketId) {
+        io.to(recipientSocketId).emit("directMessage", {
+          sender,
+          encryptedAESKey,
+          encryptedMessage,
+        });
+        console.log(`✅ DM delivered to ${recipient} on socket ${recipientSocketId}`);
+      } else {
+        console.log(`⚠️ ${recipient} is offline - message saved to DB only`);
+      }
+    } catch (err) {
+      console.error("❌ Error handling DM:", err);
+    }
+  });
+
+  // Room typing indicators
   socket.on("typing", (room) => {
     socket.to(room).emit("typing", socket.username);
   });
 
   socket.on("stopTyping", (room) => {
     socket.to(room).emit("stopTyping", socket.username);
+  });
+
+  // DM typing indicators (NEW)
+  socket.on("typingDM", (targetUser) => {
+    const targetSocketId = userSockets.get(targetUser);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit("typingDM", socket.username);
+    }
+  });
+
+  socket.on("stopTypingDM", (targetUser) => {
+    const targetSocketId = userSockets.get(targetUser);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit("stopTypingDM", socket.username);
+    }
   });
 
   socket.on("disconnect", () => {
